@@ -1,23 +1,27 @@
 import os
 import time
+from datetime import datetime
 from flask import Flask, request, jsonify
 import google.generativeai as genai
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# 1. Инициализация веб-сервера и Telegram-бота
 app = Flask(__name__)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN) if TOKEN else None
 
+# База данных в оперативной памяти (для теста)
 client_sessions = {}
 order_counters = {} 
 
+# Хранилище для статистики смены
+day_orders_archive = []  # Сюда сохраняем данные каждого закрытого заказа
+active_orders_timers = {} # Тут храним время старта: {phone: {"start_time": timestamp, "items_count": X}}
+
 @app.route('/', methods=['GET'])
 def home():
-    return "AI_HoReCa_Tech Engine is Running Sub-Partner Network Active!", 200
+    return "AI_HoReCa_Tech Engine: Time-Tracker & Reports Active!", 200
 
-# 2. Имитация вебхука входящих сообщений WhatsApp
 @app.route('/whatsapp/webhook', methods=['POST'])
 def whatsapp_webhook():
     data = request.json
@@ -52,13 +56,8 @@ def whatsapp_webhook():
     system_instruction = (
         f"Ты — умный ИИ-официант ресторана '{config['name']}'. Отвечай вежливо, кратко, на языке клиента.\n"
         f"Текущий режим работы: {config['mode']}. Стол клиента: {table_num}.\n"
+        "Когда клиент четко определился с заказом, сформируй финальный список в формате: 'ЗАКАЗ: [список блюд], ИТОГО: [сумма без букв, только число, например 25]'."
     )
-    if config["flag_delivery"]:
-        system_instruction += "У нас доступна ДОСТАВКА. Если клиент хочет доставку, вежливо спроси его адрес и имя.\n"
-    if config["flag_tara"]:
-        system_instruction += f"Мы можем упаковать еду с собой. Пластиковая тара стоит {config['price_tara']}.\n"
-    
-    system_instruction += "Когда клиент четко определился с заказом, сформируй финальный список в формате: 'ЗАКАЗ: [список блюд], ИТОГО: [сумма]'."
 
     client_sessions[phone].append(f"Клиент: {message}")
     prompt = system_instruction + "\n" + "\n".join(client_sessions[phone])
@@ -71,6 +70,11 @@ def whatsapp_webhook():
         ai_reply = "Salam! Извините, технический сбой, повторите через минуту."
 
     if "ЗАКАЗ:" in ai_reply:
+        # Фиксируем время старта готовки (когда ИИ сформировал заказ)
+        active_orders_timers[phone] = {
+            "start_time": time.time(),
+            "raw_reply": ai_reply
+        }
         send_order_to_kitchen(restaurant_id, phone, ai_reply, config, table_num)
 
     return jsonify({"status": "success", "reply": ai_reply})
@@ -89,27 +93,133 @@ def send_order_to_kitchen(restaurant_id, phone, order_text, config, table_num):
         msg_text = f"📦 **НОВЫЙ ЗАКАЗ В ОЧЕРЕДЬ (№{current_num})**\n\nКлиент: {phone}\n{order_text}"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton(text=f"✅ Заказ №{current_num} Готов", callback_data=f"ready_{current_num}_{phone}"))
+        # Добавляем кнопку закрытия смены в каждое сообщение для администратора (или можно отдельной командой)
+        markup.add(InlineKeyboardButton(text="🔒 Закрыть смену (Отчет)", callback_data=f"close_shift_{restaurant_id}"))
         bot.send_message(chat_id, msg_text, reply_markup=markup)
     else:
         msg_text = f"🍽️ **ЗАКАЗ ЗА СТОЛ №{table_num}**\n\nКлиент: {phone}\n{order_text}"
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton(text="💵 Разделить чек на компанию", callback_data=f"split_{table_num}"))
-        markup.add(InlineKeyboardButton(text="🥡 Требуется пластиковая тара", callback_data=f"tara_{table_num}"))
-        markup.add(InlineKeyboardButton(text="❌ Закрыть стол / Оплачено", callback_data=f"close_{table_num}"))
+        markup.add(InlineKeyboardButton(text="🥡 Нужна тара", callback_data=f"tara_{table_num}"))
+        markup.add(InlineKeyboardButton(text="✅ Стол Оплачен / Закрыт", callback_data=f"ready_table_{table_num}_{phone}"))
+        markup.add(InlineKeyboardButton(text="🔒 Закрыть смену (Отчет)", callback_data=f"close_shift_{restaurant_id}"))
         bot.send_message(chat_id, msg_text, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_kitchen_buttons(call):
     data = call.data
-    if data.startswith("ready_"):
+    
+    # 1. Повар нажал "Готов" в режиме электронной очереди
+    if data.startswith("ready_") and not data.startswith("ready_table_") and not data.startswith("close_shift_"):
         _, order_num, client_phone = data.split("_")
-        bot.answer_callback_query(call.id, text=f"Заказ №{order_num} закрыт!")
+        
+        # Считаем время готовки
+        cooking_time_str = "Неизвестно"
+        if client_phone in active_orders_timers:
+            start_time = active_orders_timers[client_phone]["start_time"]
+            duration = time.time() - start_time # время в секундах
+            minutes = int(duration // 60)
+            seconds = int(duration % 60)
+            cooking_time_str = f"{minutes} мин {seconds} сек"
+            
+            # Парсим сумму для отчета (ищем цифры после ИТОГО:)
+            raw_text = active_orders_timers[client_phone]["raw_reply"]
+            price = 0
+            try:
+                if "ИТОГО:" in raw_text:
+                    price_part = raw_text.split("ИТОГО:")[1].strip().replace("AZN","").replace(".","").strip()
+                    price = int(''.join(filter(str.isdigit, price_part)))
+            except:
+                price = 10 # дефолт если не распарсилось
+                
+            # Сохраняем в архив смены
+            day_orders_archive.append({
+                "type": "queue",
+                "number": order_num,
+                "duration_sec": duration,
+                "price": price
+            })
+            del active_orders_timers[client_phone]
+
+        bot.answer_callback_query(call.id, text=f"Заказ №{order_num} готов!")
         bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
-                              text=f"✅ **Заказ №{order_num} ВЫДАН**\nУведомление клиенту отправлено.")
-    elif data.startswith("tara_"):
-        table = data.split("_")[1]
-        bot.answer_callback_query(call.id, text="Уведомление: Тара будет собрана.")
-        bot.send_message(call.message.chat.id, f"🥡 Повару отправлен сигнал: Собрать пластиковую тару для стола №{table}")
+                              text=f"✅ **Заказ №{order_num} ВЫДАН**\n⏱️ Время готовки: {cooking_time_str}\nУведомление клиенту отправлено.")
+
+    # 2. Официант закрыл стол в режиме ресторана
+    elif data.startswith("ready_table_"):
+        _, _, table_num, client_phone = data.split("_")
+        cooking_time_str = "Неизвестно"
+        
+        if client_phone in active_orders_timers:
+            start_time = active_orders_timers[client_phone]["start_time"]
+            duration = time.time() - start_time
+            minutes = int(duration // 60)
+            seconds = int(duration % 60)
+            cooking_time_str = f"{minutes} мин {seconds} сек"
+            
+            raw_text = active_orders_timers[client_phone]["raw_reply"]
+            price = 0
+            try:
+                if "ИТОГО:" in raw_text:
+                    price_part = raw_text.split("ИТОГО:")[1].strip()
+                    price = int(''.join(filter(str.isdigit, price_part)))
+            except:
+                price = 20
+                
+            day_orders_archive.append({
+                "type": "table",
+                "number": table_num,
+                "duration_sec": duration,
+                "price": price
+            })
+            del active_orders_timers[client_phone]
+
+        bot.answer_callback_query(call.id, text=f"Стол №{table_num} закрыт!")
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
+                              text=f"💵 **Стол №{table_num} ОПЛАЧЕН**\n⏱️ Время обслуживания: {cooking_time_str}")
+
+    # 3. НАЖАТИЕ КНОПКИ ЗАКРЫТИЯ СМЕНЫ И СБОР ОТЧЕТА
+    elif data.startswith("close_shift_"):
+        restaurant_id = data.split("_")[2]
+        
+        if not day_orders_archive:
+            bot.answer_callback_query(call.id, text="Заказов за смену еще нет! Закрывать нечего.")
+            return
+
+        # Считаем аналитику
+        total_orders = len(day_orders_archive)
+        total_revenue = sum([item["price"] for item in day_orders_archive])
+        avg_time_sec = sum([item["duration_sec"] for item in day_orders_archive]) / total_orders
+        
+        avg_min = int(avg_time_sec // 60)
+        avg_sec = int(avg_time_sec % 60)
+        
+        # Экономия времени: 3 минуты (180 сек) на заказ ручного труда кассира
+        saved_time_total_sec = total_orders * 180
+        saved_hours = int(saved_time_total_sec // 3600)
+        saved_mins = int((saved_time_total_sec % 3600) // 60)
+
+        current_time_str = datetime.now().strftime("%d.%m.%Y в %H:%M")
+
+        report_text = (
+            f"🔒 **СМЕНА ОФИЦИАЛЬНО ЗАКРЫТА**\n"
+            f"📅 Время закрытия кассы: {current_time_str}\n"
+            f"-----------------------------------------\n"
+            f"💰 **ФИНАНСЫ ЗА ДЕНЬ:**\n"
+            f"• Всего заказов через ИИ: **{total_orders} шт.**\n"
+            f"• Итоговая выручка: **{total_revenue} AZN**\n\n"
+            f"⏱️ **ЭФФЕКТИВНОСТЬ КУХНИ:**\n"
+            f"• Среднее время готовки/сервиса: **{avg_min} мин {avg_sec} сек**\n\n"
+            f"🚀 **МАРКЕТИНГОВАЯ ВЫГОДА:**\n"
+            f"• Сэкономлено рабочего времени персонала: **~{saved_hours} ч {saved_mins} мин**\n"
+            f"• *Персонал сфокусировался на качестве еды и выдаче, не отвлекаясь на прием заказов!*"
+        )
+        
+        # Сбрасываем архивы на следующий день
+        day_orders_archive.clear()
+        client_sessions.clear()
+
+        bot.answer_callback_query(call.id, text="Смена закрыта! Отчет сформирован.")
+        bot.send_message(call.message.chat.id, report_text)
 
 if __name__ == "__main__":
     if bot:
