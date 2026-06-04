@@ -23,20 +23,45 @@ def home():
 @app.route('/whatsapp/webhook', methods=['POST'])
 def whatsapp_webhook():
     data = request.json
-    print("Получен запрос от Green-API:", data) # Это будет видно в логах Render
-    
-    # Извлекаем данные из структуры Green-API
-    # Обратите внимание: Green-API часто шлет данные внутри ключа 'messageData'
     try:
-        sender = data.get("senderData", {}).get("sender", "")
-        message_text = data.get("messageData", {}).get("textMessageData", {}).get("textMessage", "")
-        phone = sender.split("@")[0]
-        
-        # Если это не текстовое сообщение, игнорируем
-        if not message_text:
+        # Извлекаем данные сообщения
+        message_data = data.get("messageData", {})
+        if message_data.get("typeMessage") != "textMessage":
             return jsonify({"status": "ignored"}), 200
+            
+        message_text = message_data.get("textMessageData", {}).get("textMessage", "")
+        sender = data.get("senderData", {}).get("sender", "")
+        phone = sender.split("@")[0]
+        sender_name = data.get("senderData", {}).get("senderName", "Клиент")
+        
+        # Получаем ID чата кухни из переменных окружения
+        tg_chat_id = os.environ.get("TG_KITCHEN_CHAT_ID")
+        
+        # 1. ОТПРАВЛЯЕМ СООБЩЕНИЕ КЛИЕНТА В ТЕЛЕГРАМ
+        if bot:
+            bot.send_message(tg_chat_id, f"💬 Сообщение от {sender_name}:\n{message_text}")
+
+        # 2. ЛОГИКА ИИ
+        restaurant_id = "mangal_01" 
+        config = {"name": "Ресторан Мангал Гянджа", "gemini_key": os.environ.get("GEMINI_API_KEY")}
+        genai.configure(api_key=config["gemini_key"])
+        model = genai.GenerativeModel('gemini-1.5-flash')
+
+        if phone not in client_sessions: client_sessions[phone] = []
+        client_sessions[phone].append(f"Клиент: {message_text}")
+        prompt = f"Ты официант {config['name']}. Отвечай вежливо. Итог: ЗАКАЗ: [список], ИТОГО: [число].\n" + "\n".join(client_sessions[phone][-5:])
+        
+        ai_reply = model.generate_content(prompt).text
+        client_sessions[phone].append(f"ИИ: {ai_reply}")
+
+        # 3. ЕСЛИ ЗАКАЗ - ДУБЛИРУЕМ В ТЕЛЕГРАМ
+        if "ЗАКАЗ:" in ai_reply and bot:
+            bot.send_message(tg_chat_id, f"✅ ИИ сформировал заказ:\n{ai_reply}")
+            
+        return jsonify({"status": "success", "reply": ai_reply})
     except Exception as e:
-        return jsonify({"status": "error", "details": str(e)}), 400
+        print(f"Ошибка: {e}")
+        return jsonify({"status": "error"}), 500
 
     # Ваши настройки
     restaurant_id = "mangal_01" 
