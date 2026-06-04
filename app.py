@@ -21,7 +21,16 @@ active_orders_timers = {} # Тут храним время старта: {phone:
 @app.route('/', methods=['GET'])
 def home():
     return "AI_HoReCa_Tech Engine: Time-Tracker & Reports Active!", 200
-
+@app.route('/whatsapp/webhook', methods=['POST'])
+def whatsapp_webhook():
+    # Получаем данные от Green-API
+    data = request.json
+    # Логируем данные, чтобы видеть их в консоли Render (для отладки)
+    print("Получен запрос от Green-API:", data)
+    
+    # Сюда можно добавить логику обработки данных, если нужно
+    # Пока просто подтверждаем получение
+    return jsonify({"status": "success"}), 200
 @app.route('/whatsapp/webhook', methods=['POST'])
 def whatsapp_webhook():
     data = request.json
