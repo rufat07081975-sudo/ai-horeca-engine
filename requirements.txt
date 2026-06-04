@@ -1,0 +1,4 @@
+flask
+gunicorn
+telebot
+google-generativeai
